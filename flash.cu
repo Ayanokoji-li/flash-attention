@@ -1,4 +1,5 @@
 #include <cooperative_groups.h>
+#include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/types.h>
@@ -133,19 +134,26 @@ __global__ void forward_decode_map(const float *Q, const float *K,
   float *Ok = &O[o_offset + ty * d * N];
 
   for (int j = j_offset; j < Tr && j < j_offset + j_gap; j++) {
+    // for (int j = ty; j < Tr; j += multithread) {
     for (int x = 0; x < d; x++) {
       Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
       Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
     }
 
-    cg_block.sync();
+    // __syncthreads(); // such that the inner loop can use the correct Kj, Vj
 
     for (int i = 0; i < Tc; i++) {
+      cg_block.sync();
       for (int x = d_gap * ty; x < d && x < d_gap * (ty + 1); x++) {
         Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
       }
 
+      // for (int x = ty; x < d; x += multithread) {
+      //   Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+      // }
+
       cg_block.sync();
+      // __syncthreads(); // such that the inner loop can use the correct Kj, Vj
 
       float row_m_prev = mk[i * Bc + tx];
       float row_l_prev = lk[i * Bc + tx];
@@ -189,6 +197,8 @@ __global__ void forward_decode_map(const float *Q, const float *K,
 
       mk[i * Bc + tx] = row_m_new;
       lk[Br * i + tx] = row_l_new;
+      // cg_block.sync();
+      // __syncthreads(); // such that the inner loop can use the correct Kj, Vj
     }
 
     cg_block.sync();
@@ -312,22 +322,40 @@ torch::Tensor forward_decode(torch::Tensor Q, torch::Tensor K,
   // (Bc * multithread * d * sizeof(float));            // O cache
   int max_sram_size;
   cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-  printf("Max shared memory: %d, requested shared memory: %d 121\n",
-         max_sram_size, sram_size);
+  printf("Max shared memory: %d, requested shared memory: %d\n", max_sram_size,
+         sram_size);
 
   dim3 map_grid_dim(B, nh);            // batch_size x num_heads
   dim3 map_block_dim(Bc, multithread); // Bc * multithread threads per block
   dim3 reduce_grid_dim(B, nh, Tc);     // batch_size * num_heads * Tc
   dim3 reduce_block_dim(Bc);           // Bc threads per block
 
+  cudaEvent_t map_start, map_end, reduce_start, reduce_end;
+  cudaEventCreate(&map_start);
+  cudaEventCreate(&map_end);
+  cudaEventCreate(&reduce_start);
+  cudaEventCreate(&reduce_end);
+
+  cudaEventRecord(map_start);
   forward_decode_map<<<map_grid_dim, map_block_dim, sram_size>>>(
       Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(), N, d, Tc,
       Tr, Bc, Br, softmax_scale, l.data_ptr<float>(), m.data_ptr<float>(),
       O_map.data_ptr<float>(), multithread);
+  cudaEventRecord(map_end);
+
+  cudaEventRecord(reduce_start);
   forward_decode_reduce<<<reduce_grid_dim, reduce_block_dim>>>(
       O_map.data_ptr<float>(), O_reduce.data_ptr<float>(), l.data_ptr<float>(),
       m.data_ptr<float>(), N, d, Tc, Bc, multithread);
+  cudaEventRecord(reduce_end);
+
   cudaDeviceSynchronize();
+  float elapse_ms;
+  cudaEventElapsedTime(&elapse_ms, map_start, map_end);
+  printf("[map] time: %.3f", elapse_ms);
+
+  cudaEventElapsedTime(&elapse_ms, reduce_start, reduce_end);
+  printf("[reduce] time: %.3f", elapse_ms);
 
   return O_reduce;
   // return O_map;
