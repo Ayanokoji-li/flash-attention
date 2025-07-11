@@ -237,6 +237,8 @@ __global__ void forward_decode_reduce(const float *O_input, float *O_output,
   const auto bz = blockIdx.z;
   const auto tx = threadIdx.x;
 
+  extern __shared__ float tmp_O[];
+
   const int kv_offset = (bx * gridDim.y * N * d * multithread) +
                         (by * N * d * multithread); // gridDim.y = nh
   const int qin_offset = kv_offset;
@@ -245,32 +247,40 @@ __global__ void forward_decode_reduce(const float *O_input, float *O_output,
                         (by * N * multithread); // offset for l and m
   const auto tile_size = Bc * d;
 
-  for (int i = 0; i < Tc; i++) {
-    float local_m = -INFINITY;
-    float local_l = 0;
+  float local_m = -INFINITY;
+  float local_l = 0;
+  for (int tid = 0; tid < multithread; tid++) {
+    local_m = max(m[lm_offset + tid * N + bz * Bc + tx], local_m);
+  }
+
+  for (int tid = 0; tid < multithread; tid++) {
+    local_l += __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
+               l[lm_offset + tid * N + bz * Bc + tx];
+  }
+  for (int x = 0; x < d; x++) {
+    // O_output[qout_offset + tile_size * bz + tx * d + x] = 0;
+    tmp_O[x * Bc + tx] = 0;
     for (int tid = 0; tid < multithread; tid++) {
-      local_m = max(m[lm_offset + tid * N + bz * Bc + tx], local_m);
+      // O_output[qout_offset + tile_size * bz + tx * d + x] +=
+      //     (1 / local_l) *
+      //     (l[lm_offset + tid * N + bz * Bc + tx] *
+      //      __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
+      //  O_input[qin_offset + tid * N * d + (tile_size * bz) + tx * d + x]);
+
+      // O_output[qout_offset + tile_size * bz + tx * d + x] +=
+      //     (1 / local_l) *
+      //     (l[lm_offset + tid * N + bz * Bc + tx] *
+      //      __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
+      //      O_input[qin_offset + tid * N * d + x * N + bz * Bc + tx]);
+
+      tmp_O[x * Bc + tx] +=
+          (1 / local_l) *
+          (l[lm_offset + tid * N + bz * Bc + tx] *
+           __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
+           O_input[qin_offset + tid * N * d + x * N + bz * Bc + tx]);
     }
 
-    for (int tid = 0; tid < multithread; tid++) {
-      local_l += __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
-                 l[lm_offset + tid * N + bz * Bc + tx];
-    }
-    for (int x = 0; x < d; x++) {
-      O_output[qout_offset + tile_size * bz + tx * d + x] = 0;
-      for (int tid = 0; tid < multithread; tid++) {
-        // O_output[qout_offset + tile_size * bz + tx * d + x] +=
-        //     (1 / local_l) *
-        //     (l[lm_offset + tid * N + bz * Bc + tx] *
-        //      __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
-        //  O_input[qin_offset + tid * N * d + (tile_size * bz) + tx * d + x]);
-        O_output[qout_offset + tile_size * bz + tx * d + x] +=
-            (1 / local_l) *
-            (l[lm_offset + tid * N + bz * Bc + tx] *
-             __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
-             O_input[qin_offset + tid * N * d + x * N + bz * Bc + tx]);
-      }
-    }
+    O_output[qout_offset + tile_size * bz + tx * d + x] = tmp_O[x * Bc + tx];
   }
 }
 
@@ -343,15 +353,17 @@ torch::Tensor forward_decode(torch::Tensor Q, torch::Tensor K,
   O_map = O_map.to(device);
 
   // Calculate SRAM size needed per block
-  const int sram_size =
+  const int map_sram_size =
       ((1 + multithread * 2) * Bc * d * sizeof(float)) + // Q, K, V cache
       (Bc * Br * sizeof(float) * multithread); // +          // S cache
   // (Bc * 2 * sizeof(float)); // +                         // l, m cache
   // (Bc * multithread * d * sizeof(float));            // O cache
+  const int reduce_sram_size = Bc * d * sizeof(float);
+
   int max_sram_size;
   cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
   printf("Max shared memory: %d, requested shared memory: %d\n", max_sram_size,
-         sram_size);
+         map_sram_size);
 
   dim3 map_grid_dim(B, nh);            // batch_size x num_heads
   dim3 map_block_dim(multithread, Bc); // Bc * multithread threads per block
@@ -365,14 +377,15 @@ torch::Tensor forward_decode(torch::Tensor Q, torch::Tensor K,
   cudaEventCreate(&reduce_end);
 
   cudaEventRecord(map_start);
-  forward_decode_map<<<map_grid_dim, map_block_dim, sram_size>>>(
+  forward_decode_map<<<map_grid_dim, map_block_dim, map_sram_size>>>(
       Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(), N, d, Tc,
       Tr, Bc, Br, softmax_scale, l.data_ptr<float>(), m.data_ptr<float>(),
       O_map.data_ptr<float>(), multithread);
   cudaEventRecord(map_end);
 
   cudaEventRecord(reduce_start);
-  forward_decode_reduce<<<reduce_grid_dim, reduce_block_dim>>>(
+  forward_decode_reduce<<<reduce_grid_dim, reduce_block_dim,
+                          reduce_sram_size>>>(
       O_map.data_ptr<float>(), O_reduce.data_ptr<float>(), l.data_ptr<float>(),
       m.data_ptr<float>(), N, d, Tc, Bc, multithread);
   cudaEventRecord(reduce_end);
