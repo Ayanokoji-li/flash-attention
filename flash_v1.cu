@@ -101,8 +101,8 @@ __global__ void forward_decode_map(const float *Q, const float *K,
                                    const int Br, const float softmax_scale,
                                    float *l, float *m, float *O,
                                    int multithread) {
-  int tx = threadIdx.y; // Bc id
-  int ty = threadIdx.x; // multithread id
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
   int bx = blockIdx.x;
   int by = blockIdx.y; // batch and head index
   auto cg_block = cooperative_groups::this_thread_block();
@@ -326,7 +326,7 @@ torch::Tensor forward_decode(torch::Tensor Q, torch::Tensor K,
          sram_size);
 
   dim3 map_grid_dim(B, nh);            // batch_size x num_heads
-  dim3 map_block_dim(multithread, Bc); // Bc * multithread threads per block
+  dim3 map_block_dim(Bc, multithread); // Bc * multithread threads per block
   dim3 reduce_grid_dim(B, nh, Tc);     // batch_size * num_heads * Tc
   dim3 reduce_block_dim(Bc);           // Bc threads per block
 
