@@ -207,9 +207,14 @@ __global__ void forward_decode_map(const float *Q, const float *K,
           pv += S[(Br * y) + tx] * Vj[(x * Bc) + y];
         }
 
-        Ok[i * tile_size + tx * d + x] =
+        // Ok[i * tile_size + tx * d + x] =
+        //     (1 / row_l_new) * ((row_l_prev * __expf(row_m_prev - row_m_new) *
+        //                         Ok[i * tile_size + tx * d + x]) +
+        //                        __expf(row_m - row_m_new) * pv);
+
+        Ok[x * N + i * Bc + tx] =
             (1 / row_l_new) * ((row_l_prev * __expf(row_m_prev - row_m_new) *
-                                Ok[i * tile_size + tx * d + x]) +
+                                Ok[x * N + i * Bc + tx]) +
                                __expf(row_m - row_m_new) * pv);
       }
 
@@ -254,11 +259,16 @@ __global__ void forward_decode_reduce(const float *O_input, float *O_output,
     for (int x = 0; x < d; x++) {
       O_output[qout_offset + tile_size * bz + tx * d + x] = 0;
       for (int tid = 0; tid < multithread; tid++) {
+        // O_output[qout_offset + tile_size * bz + tx * d + x] +=
+        //     (1 / local_l) *
+        //     (l[lm_offset + tid * N + bz * Bc + tx] *
+        //      __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
+        //  O_input[qin_offset + tid * N * d + (tile_size * bz) + tx * d + x]);
         O_output[qout_offset + tile_size * bz + tx * d + x] +=
             (1 / local_l) *
             (l[lm_offset + tid * N + bz * Bc + tx] *
              __expf(m[lm_offset + tid * N + bz * Bc + tx] - local_m) *
-             O_input[qin_offset + tid * N * d + (tile_size * bz) + tx * d + x]);
+             O_input[qin_offset + tid * N * d + x * N + bz * Bc + tx]);
       }
     }
   }
@@ -323,7 +333,7 @@ torch::Tensor forward_decode(torch::Tensor Q, torch::Tensor K,
   const float softmax_scale = 1.0 / sqrt(d);
 
   // Initialize O, l, m to HBM
-  auto O_map = torch::zeros({B, nh, N, d, multithread});
+  auto O_map = torch::zeros({B, nh, multithread, d, N});
   auto O_reduce = torch::zeros_like(Q);
   auto l = torch::zeros({B, nh, N, multithread});
   auto m = torch::full({B, nh, N, multithread}, -INFINITY);
