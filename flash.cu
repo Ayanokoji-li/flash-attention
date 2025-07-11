@@ -136,8 +136,12 @@ __global__ void forward_decode_map(const float *Q, const float *K,
   for (int j = j_offset; j < Tr && j < j_offset + j_gap; j++) {
     // for (int j = ty; j < Tr; j += multithread) {
     for (int x = 0; x < d; x++) {
-      Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
-      Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+      // Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
+      // Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+
+      // transposed
+      Kj[x * Bc + tx] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
+      Vj[x * Bc + tx] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
     }
 
     // __syncthreads(); // such that the inner loop can use the correct Kj, Vj
@@ -162,10 +166,17 @@ __global__ void forward_decode_map(const float *Q, const float *K,
       for (int y = 0; y < Br; y++) {
         float sum = 0;
         for (int x = 0; x < d; x++) {
-          sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+          // sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+
+          // transposed
+          sum += Qi[(tx * d) + x] * Kj[x * Bc + y];
         }
         sum *= softmax_scale;
-        S[(Bc * tx) + y] = sum;
+
+        // S[(Bc * tx) + y] = sum;
+
+        // transposed
+        S[(Br * y) + tx] = sum;
 
         if (sum > row_m)
           row_m = sum;
@@ -174,8 +185,12 @@ __global__ void forward_decode_map(const float *Q, const float *K,
       // P = exp(S - row_m), row_l = rowsum(P)
       float row_l = 0;
       for (int y = 0; y < Bc; y++) {
-        S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-        row_l += S[(Bc * tx) + y];
+        // S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
+        // row_l += S[(Bc * tx) + y];
+
+        // transpose
+        S[(Br * y) + tx] = __expf(S[(Br * y) + tx] - row_m);
+        row_l += S[(Br * y) + tx];
       }
 
       // Compute new m and l
@@ -186,7 +201,10 @@ __global__ void forward_decode_map(const float *Q, const float *K,
       for (int x = 0; x < d; x++) {
         float pv = 0;
         for (int y = 0; y < Bc; y++) {
-          pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+          // pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+
+          // transposed
+          pv += S[(Br * y) + tx] * Vj[(x * Bc) + y];
         }
 
         Ok[i * tile_size + tx * d + x] =
